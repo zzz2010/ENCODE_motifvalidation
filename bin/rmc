@@ -1,0 +1,513 @@
+#!/bin/sh
+
+# takes a file, breaks it into chunks, sends each chunk to a different queue with command
+
+NUMNODES=10
+SEP=" "
+QUEUE=""
+INPUTMODE=0
+ILINPUT=0
+OUTFILE="/dev/stdout"
+ERRFILE="/dev/stderr"
+JOBINFO="/dev/stderr"
+MEMREQ=2000
+INFILE=-
+CMD="zsh -e"
+CYCLESECONDS=2
+JOBPRIO=40
+
+if [ ! -z "$PSUB_DIR" ]; then
+	TMPDIR=$PSUB_DIR
+else
+	TMPDIR=/tmp/$USER/jobs
+fi
+
+if [ "$1" = "-h" ]; then
+		echo >&2 "USAGE: $0 [OPTIONS] [COMMAND]
+ -c  Command to use; note: non-escaped command can be included at end and will override [default: $CMD]
+ -i  Input file, if blank then no splitting and index is passed into command, - for stdin, + for 1 command mode [default: -]
+ -o  Stdout (if -, fail if present) [default: /dev/stdout]
+ -e  Stderr (if -, fail if present) [default: /dev/stderr]
+ -v  Where to output job status counts [default: /dev/stderr]
+ -d  Working directory to use [default: temp in $TMPDIR]
+ -r  Recover run started in indicated directory; use with extreme caution 
+ -n  Number of jobs to spawn (if 0, just run on self; if -1 then the number of lines) [default: $NUMNODES]
+ -s  Separator to use [default: (space)]
+ -q  Queue to use [default: $QUEUE]
+ -f  Input line segmentation mode [default: $INPUTMODE]
+ 	 0   Each line is a segment
+	 1   FASTA input (> starts a new segement)
+	 2   Blank lines start new segments 
+	 3   Change in first column indicates new segment
+	 each line; 1, FASTA; 2, blank lines) [default: $INPUTMODE]
+ -I  Input to subprocesses to be interleaved (rather than kept in contiguous blocks) [default: $ILINPUT]
+ -m  Memory to request for each job submitted [default: $MEMREQ]
+ -p  Special pipe character (permits pipes in [COMMAND])
+ -P  Priority of submitted jobs [default: $JOBPRIO]
+ -N  Name to add to generated job directory"
+	exit 1
+fi
+
+while getopts c:i:o:e:d:n:s:q:f:I:m:p:r:v:P:N: o
+do      case "$o" in
+		c)		CMD="$OPTARG";;
+		i)		INFILE="$OPTARG";;
+		o)		OUTFILE="$OPTARG";;
+		e)		ERRFILE="$OPTARG";;
+		d)		DIR="$OPTARG";;
+		n)		NUMNODES="$OPTARG";;
+		s)		SEP="$OPTARG";;
+		q)		QUEUE="$OPTARG";;
+		f)		INPUTMODE="$OPTARG";;
+		I)		ILINPUT="$OPTARG";;
+		m)		MEMREQ="$OPTARG";;
+		p)		PIPESTR="$OPTARG";;
+		r)		RESUMEDIR="$OPTARG";;
+		v)		JOBINFO="$OPTARG";;
+		P)		JOBPRIO="$OPTARG";;
+		N)		NAME="$OPTARG";;
+        [?])    echo >&2 "ERROR: command line parameter not recognized."; exit 1;;
+        esac
+done
+
+shift $(expr $OPTIND - 1)
+
+if [ $# -ne 0 ]; then
+	# add quotes to each argument... note: without PIPESTR it would be impossible
+	# to pipe something because it would be quoted
+	CMD=""
+	for i in "$@"; do
+		if [ ! -z "$PIPESTR" ] && [ "$PIPESTR" = "$i" ]; then 
+			CMD="$CMD |"
+		else
+			CMD="$CMD '${i//'/'\\''}'"
+		fi
+	done
+fi
+
+if [ ! -z "$RESUMEDIR" ]; then
+	DIR=$RESUMEDIR
+elif [ -z "$DIR" ]; then
+	mkdir -p $TMPDIR
+	if [ ! -z "$NAME" ]; then 
+		DIR=$(mktemp -d $TMPDIR/$(date +%s).rmc.${NAME}.XXXXXX)
+	else
+		DIR=$(mktemp -d $TMPDIR/$(date +%s).rmc.XXXXXX)
+	fi
+
+	trap "while ! rm -rf '$DIR' 2> /dev/null; do sleep 1; done" EXIT
+fi
+
+mkdir -p $DIR
+
+if [ "$INFILE" = "-" ]; then
+	cat | gzip -c > $DIR/input.txt.gz
+	INFILE="$DIR/input.txt.gz"
+elif [ "$INFILE" = "+" ]; then
+	NUMNODES=1
+fi
+
+# if supplied, split the input file
+if [ ! -z "$INFILE" -a ! "$INFILE" = "+" ]; then
+	# use these to build the awk commands on the basis of INPUTMODE and ILINPUT
+	# if INPUTMODE=1 then make X indicate the current FASTA sequence number and use when splitting rather than the line number
+	# NOTE: these should not have spaces because of how they are processed later... could probably be fixed
+	if [ "$INPUTMODE" = 0 ]; then
+		AWKSPLITPRE=""
+		AWKSPLITVAR="NR"
+	elif [ "$INPUTMODE" = 1 ]; then 
+		AWKSPLITPRE="/^>/{X++};"
+		AWKSPLITVAR="X"
+	elif [ "$INPUTMODE" = 2 ]; then 
+		AWKSPLITPRE="NR==1||/^$/{X++};"
+		AWKSPLITVAR="X"
+
+		# collapse groups of blank lines and remove trailing blank lines
+		gunzip -cf $INFILE | awk '/^$/{S=1; next}; S{print ""; S=0}; 1' | gzip -c > $DIR/input-shrink.txt.gz
+		INFILE=$DIR/input-shrink.txt.gz
+	elif [ "$INPUTMODE" = 3 ]; then 
+		AWKSPLITPRE="NR==1||\$1!=L{X++;L=\$1};"
+		AWKSPLITVAR="X"
+	fi
+
+	# if ILINPUT = 0, then split into nearly equal sized chunks (1,1,1,2,2,2,3,3,3), otherwise interleave the output (1,2,3,1,2,3,...)
+	if [ "$ILINPUT" = 0 ]; then
+		AWKSPLITNUM="(int(($AWKSPLITVAR-1)*NC/NL)+1)"
+	else
+		AWKSPLITNUM="((($AWKSPLITVAR-1)%NC)+1)"
+	fi
+
+	# count the number of "lines"
+	LINES=$(gunzip -cf $INFILE | awk ''$AWKSPLITPRE' END{print '$AWKSPLITVAR'+0}')
+
+	# the number of chunks cannot be greater than the number of "lines"
+	if [ $NUMNODES -eq -1 -o $LINES -lt $NUMNODES ]; then
+		NUMNODES=$LINES
+	fi
+
+	for i in $(seq $NUMNODES); do
+		mkdir $DIR/$i
+	done
+	mkdir -p $DIR/1
+
+	# break file into chunks
+	gunzip -cf $INFILE | awk -vNC=$NUMNODES -vNL=$LINES ''$AWKSPLITPRE' BEGIN{NC=NC<1?1:NC}; {print > ("'$DIR'/"'$AWKSPLITNUM'"/in")}'
+
+	if [ -f "$DIR/input.txt.gz" ]; then
+		rm -f $DIR/input.txt.gz
+	fi
+fi
+
+trap "touch '$DIR'/abort" INT
+
+function RUNCMD () { 
+	local CMDINPUT
+	if [ ! -z "$INFILE" ]; then
+		CMDINPUT=$DIR/$1/in
+	else
+		CMDINPUT=$1
+	fi
+
+	if [ "$INFILE" = "+" ]; then 
+		echo "$CMD"
+	elif [ "$CMD" != "${CMD/\%s/}" ]; then
+		echo "${CMD/\%s/$CMDINPUT}"
+	else
+		echo "$CMD$SEP$CMDINPUT"
+	fi
+}
+
+function SUBJOB () {
+	mkdir -p $DIR/$1
+	local ff=$DIR/$1/${JOBRUN[$1]}
+	psub -b -d $ff.psub -s 0 -m ${MEMREQI[$1]} -q "$QUEUE" -P $JOBPRIO -v $ff.bout -o $ff.out -e $ff.err "$(RUNCMD $1)" > $ff.jobid
+	NUMCYCRUN[$1]=0
+	echo Sub >> $ff.info
+}
+
+if [ $NUMNODES -gt 0 ]; then 
+	if [ -z "$RESUMEDIR" ]; then
+		NOTDONE=()
+		for i in $(seq 1 $NUMNODES); do 
+			if [ ! -f $DIR/abort ]; then 
+				MEMREQI[$i]=$MEMREQ
+				JOBRUN[$i]=1
+				SUBJOB $i
+				NOTDONE=(${NOTDONE[@]} $i)
+			fi
+		done
+	else
+		NOTDONE=()
+		for i in $(seq 1 $NUMNODES); do 
+			MEMREQI[$i]=$MEMREQ
+			JOBRUN[$i]=1
+			
+			DONE=0
+			while [ -f "$DIR/$i/${JOBRUN[$i]}.info" ]; do
+				if grep -q Done $DIR/$i/${JOBRUN[$i]}.info; then
+					DONE=1
+					break
+				else
+					JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+				fi
+			done
+
+			if [ $DONE -eq 0 ]; then
+				SUBJOB $i
+				NOTDONE=(${NOTDONE[@]} $i)
+			fi
+		done
+	fi
+elif [ $LINES -gt 0 ]; then
+	RUNCMD 1 | sh > $DIR/1/1.out 2> $DIR/1/1.err
+	NUMNODES=1
+	JOBRUN[1]=1
+fi
+
+CYCLE=0
+NUMSPLITJOBS=0
+NUMBROKENJOBS=0
+FAILURE=0
+while [ ${#NOTDONE[@]} -gt 0 ]; do
+	NOTDONENEW=()
+	CYCLE=$(expr 1 + $CYCLE)
+	for i in ${NOTDONE[@]}; do
+		ff=$DIR/$i/${JOBRUN[$i]}
+		DONE=0
+		if [ -f $DIR/abort -o $FAILURE -eq 1 -o $NUMBROKENJOBS -ge $(expr $NUMNODES \* 2) ]; then
+			# kill all the submitted sub-jobs and wait for them to be cleaned up
+			FAILURE=1
+
+			if [ -z "$ABORTCYCLE" ]; then	
+				ABORTCYCLE=$CYCLE
+			fi
+
+			if [ ! -f $ff.kill ]; then 
+				if [ -f $DIR/abort ]; then 
+					echo Abort >> $ff.info
+				elif [ $NUMBROKENJOBS -ge $(expr $NUMNODES \* 2) ]; then
+					echo TooManyBroken >> $ff.info
+				fi
+				echo Kill >> $ff.info
+			fi
+
+			bkill -r $(cat $ff.jobid) > $ff.kill 2>&1 
+
+			# we are done if one of
+			# 1. there is an output file
+			# 2. we have been waiting 10 cycles and there is no started
+			# 3. we have been waiting 60 cycles
+			if [ -s $ff.bout ]; then
+				echo KillOut >> $ff.info
+				DONE=1
+			elif [ $(expr $CYCLE - $ABORTCYCLE) -gt 10 -a ! -f $ff.psub/started ]; then
+				echo KillNoStart >> $ff.info
+				DONE=1
+			elif [ $(expr $CYCLE - $ABORTCYCLE) -gt 60 ]; then 
+				echo KillTimeOut >> $ff.info
+				DONE=1
+			fi
+
+		elif [ -f $ff.restart ]; then
+			bkill -r $(cat $ff.jobid) > $ff.kill 2>&1 
+			JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+			SUBJOB $i
+			echo Restart >> $ff.info
+
+		elif [ -f $ff.split -o -f $DIR/$i/split ]; then
+			# split job into default of 10 additional jobs
+
+			if [ -f $DIR/$i/split ]; then
+				cp $DIR/$i/split $ff.split
+			fi
+
+			# kill the old job
+			bkill -r $(cat $ff.jobid) > $ff.kill 2>&1 
+			DONE=1
+
+			# increment JOBRUN to value we will fill in
+			JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+
+			# split input file
+			NUMSPLIT=$(awk -vN=10 '($1+0)>0{N=$1+0}; END{print N}' $ff.split)
+
+			# count the number of "lines"
+			LINES=$(awk ''$AWKSPLITPRE' END{print '$AWKSPLITVAR'+0}' $DIR/$i/in)
+
+			# the number of chunks cannot be greater than the number of "lines"
+			if [ $LINES -lt $NUMSPLIT ]; then
+				NUMSPLIT=$LINES
+			fi
+
+			echo Split$NUMSPLIT >> $ff.info
+
+			for j in $(seq $(expr $NUMNODES + 1) $(expr $NUMNODES + $NUMSPLIT)); do
+				mkdir -p $DIR/$j
+			done
+
+			awk -vNC=$NUMSPLIT -vNA=$NUMNODES -vNL=$LINES ''$AWKSPLITPRE' BEGIN{NC=NC<1?1:NC}; {print > ("'$DIR'/"(NA+'$AWKSPLITNUM')"/in")}' $DIR/$i/in
+
+			# SPLITJOBS stores the original job number followed by the list of jobs
+			# to merge into it (in order)
+			NUMSPLITJOBS=$(expr $NUMSPLITJOBS + 1)
+			SPLITJOBS[$NUMSPLITJOBS]=$i
+
+			# submit new sub-jobs
+			for j in $(seq $(expr $NUMNODES + 1) $(expr $NUMNODES + $NUMSPLIT)); do
+				mkdir -p $DIR/$j
+				echo SplitJob >> $DIR/$j/1.info
+				NOTDONENEW=(${NOTDONENEW[@]} $j)
+				MEMREQI[$j]=$MEMREQ
+				JOBRUN[$j]=1
+				SUBJOB $j
+				SPLITJOBS[$NUMSPLITJOBS]="${SPLITJOBS[$NUMSPLITJOBS]} $j"
+			done
+
+			NUMNODES=$(expr $NUMNODES + $NUMSPLIT)
+		elif [ -f $ff.done -o -f $DIR/$i/done ]; then
+			# just declare this part done.
+			touch $ff.{out,err}
+			echo ForceDone >> $ff.info
+			DONE=1
+
+		elif [ ! -s $ff.bout ]; then
+			# ^ we are not done yet
+			
+			if [ "$(echo $CYCLE | awk '{print $1%100}')" -eq 0 ] && [ "$(bjobs -w $(cat $ff.jobid) 2> /dev/null | awk 'NR==2{print $3}')" = "UNKWN" ]; then
+				# check to see if job has unknown status once every 100 cycles
+				echo UnkNode >> $ff.info
+				touch $ff.restart
+
+			elif [ $CYCLE -gt 10 -a ! -f $ff.psub/started ]; then
+				# check to see if the job is stuck (dispatched to a node but started not created)
+				# do not check for the first 10 cycles
+
+				# increment number of cycles we have been running without a started being created
+				# only check running status once every 15 cycles
+				if [ "${NUMCYCRUN[$i]}" -gt 0 ] || ([ "$(echo $CYCLE | awk '{print $1%15}')" -eq 0 ] && [ "$(bjobs -w $(cat $ff.jobid) 2> /dev/null | awk 'NR==2{print $3}')" = "RUN" ]); then
+					NUMCYCRUN[$i]=$(expr 1 + ${NUMCYCRUN[$i]})
+				fi
+
+				# if we have been running for 30 cycles without a started being created, restart
+				if [ ${NUMCYCRUN[$i]} -ge 30 ]; then
+					echo Stuck >> $ff.info
+					touch $ff.restart
+				fi
+			fi
+
+		elif awk '
+			$0=="# LSBATCH: User input"{A=1}
+			$0=="------------------------------------------------------------" && A{B=1; next}
+			$1=="TERM_MEMLIMIT:" && A && B {C=1; exit}
+			$0=="Resource usage summary:"{exit}
+			END{exit !C}' $ff.bout; then
+			# if killed due to not sufficient memory, double memory request
+			MEMREQI[$i]=$(expr ${MEMREQI[$i]} + ${MEMREQI[$i]})
+
+			# but try 48gb instead of 64gb... the cluster will not do 64gb on compbio-week
+			if [ "${MEMREQI[$i]}" = "64000" ]; then
+				MEMREQI[$i]=48000
+			fi
+
+			JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+			SUBJOB $i
+
+			echo MemTo${MEMREQI[$i]} >> $ff.info
+
+		elif awk '
+			$0=="Exited"{Restart=1}
+			$0 ~ /: line 8: cannot create temp file for here document: No space left on device$/{Restart=1}
+
+			END{exit (!Restart)}' $ff.bout; then
+			# something is vaguely broken with this node... just resubmit job
+			NUMBROKENJOBS=$(expr $NUMBROKENJOBS + 1)
+			JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+			SUBJOB $i
+			echo Broke >> $ff.info
+
+		elif awk '
+			$0=="# LSBATCH: User input"{A=1}
+			$0=="------------------------------------------------------------" && A {B=1}
+			$0=="Resource usage summary:" && B {C=1}
+			$0=="The output (if any) follows:" && C {D=1}
+			$0=="Command exited with non-zero status." && D {E=1}
+			END{exit (!E)}' $ff.bout; then
+			# job exited with non-zero exit code (resubmit)
+			echo NonZeroExit >> $ff.info
+			NUMBROKENJOBS=$(expr $NUMBROKENJOBS + 1)
+			JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+			SUBJOB $i
+
+		elif awk '
+			$0=="# LSBATCH: User input"{A=1}
+			$0=="------------------------------------------------------------" && A{B=1; next}
+			$0=="Successfully completed." && A && B {C=1; exit}
+			$0=="Resource usage summary:"{exit}
+			END{exit C}' $ff.bout; then
+			# NOT successfully completed... 
+			FAILURE=1
+			DONE=1
+			echo JobFailure >> $ff.info
+
+		elif [ -f $ff.out -a -f $ff.err ]; then
+			if [ "$OUTFILE" = "-" -a -s $ff.out ] || [ "$ERRFILE" = "-" -a -s $ff.err ]; then
+				# if $OUTFILE = - or $ERRFLIE = - and the corresponding file is not empty
+				# resubmit this job
+				echo NonEmpty >> $ff.info
+				NUMBROKENJOBS=$(expr $NUMBROKENJOBS + 1)
+				JOBRUN[$i]=$(expr ${JOBRUN[$i]} + 1)
+				SUBJOB $i
+			else
+				echo Done >> $ff.info
+				# successfully completed
+				DONE=1
+			fi
+		fi
+
+		if [ $DONE -eq 0 ]; then
+			NOTDONENEW=(${NOTDONENEW[@]} $i)
+		fi
+	done
+
+	NOTDONE=( ${NOTDONENEW[@]} )
+
+	sleep $CYCLESECONDS
+done
+
+if [ $FAILURE -eq 0 ]; then
+	# deal with the split jobs (in reverse order so that split jobs can be split themselves)
+	for j in $(seq $NUMSPLITJOBS -1 1); do
+		oi=$(echo ${SPLITJOBS[$j]} | cut -f1 -d" ")
+
+		for i in $(echo ${SPLITJOBS[$j]} | cut -f2- -d" "); do
+			cat $DIR/$i/${JOBRUN[$i]}.out
+		done > $DIR/$oi/${JOBRUN[$oi]}.out
+
+		for i in $(echo ${SPLITJOBS[$j]} | cut -f2- -d" "); do
+			cat $DIR/$i/${JOBRUN[$i]}.err
+		done > $DIR/$oi/${JOBRUN[$oi]}.err
+
+		for i in $(echo ${SPLITJOBS[$j]} | cut -f2- -d" "); do
+			rm -f $DIR/$i/in
+			for k in $(seq 1 ${JOBRUN[$i]}); do
+				rm -rf $DIR/$i/$k.out
+			done
+		done
+
+		NUMNODES=$(expr $NUMNODES - $(echo ${SPLITJOBS[$j]} | awk '{print (NF-1)}'))
+	done
+
+	if [ ! -z "$OUTFILE" -a "$OUTFILE" != "-" ]; then 
+		for i in $(seq 1 $NUMNODES); do 
+			cat $DIR/$i/${JOBRUN[$i]}.out
+		done > $OUTFILE
+	fi
+
+	if [ ! -z "$ERRFILE" -a "$ERRFILE" != "-" ]; then 
+		for i in $(seq 1 $NUMNODES); do 
+			cat $DIR/$i/${JOBRUN[$i]}.err
+		done > $ERRFILE
+	fi
+
+	for i in $(seq 1 $NUMNODES); do 
+		rm -f $DIR/$i/in 
+		for j in $(seq 1 ${JOBRUN[$i]}); do
+			rm -rf $DIR/$i/$j.{out,err}
+		done
+	done
+else
+	# cancel deletion of working directory when there is a failure
+	trap - EXIT
+fi
+
+if [ ! -z "$JOBINFO" ]; then
+	find $DIR -maxdepth 2 -mindepth 2 -name "*.info" | awk -F"/" '
+		{
+			f = $0
+			j = $(NF-1)
+			n = substr($NF,1,length($NF)-5)
+			J[j]
+
+			if (n > MN[j])
+				MN[j] = n
+
+			while ((getline < f) > 0)
+				V[j,n] = V[j,n] " " n $0
+		}
+
+		END{
+			for (j in J)
+			{
+				L = ""
+				for (n=1; n<=MN[j]; n++)
+					L = L V[j,n]
+				C[L]++
+			}
+
+			for (i in C)
+				print C[i] i
+		}' | sort -k1,1n > $JOBINFO
+fi
+
+touch $DIR/exit
+
