@@ -70,7 +70,7 @@ def MotifClustRow(motifclust):
         enrichRank=writeTag("td","Enrichment Rank:<br>"+motifclust_rank[motifclust])
         motiflogo="<td colspan=1>"+motifLogo(bestmotif)+"</td>"
         posrank_plot="<td colspan=4>"+ motifPosRankPlot(bestmotif)+"</td>"
-        outstr=writeTag("tr",clustname+enrichRank+negbinomModel+motiflogo+posrank_plot )
+        outstr=writeTag("tr",clustname+enrichRank+negbinomModel+motiflogo+posrank_plot)
 	return outstr
 
 def TFImageTRs(tf):

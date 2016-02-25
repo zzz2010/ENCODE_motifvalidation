@@ -1,11 +1,12 @@
+
+Run Demo
+===========
+- type "make test" or type "python2.7 pipeline.py test/K562_CTCF_UW.bed"
+- output will be "/tmp/motifpipeline/K562_CTCF_UW"
+
+
 Commandline Workflow
 ==============
-
-Software dependency
---------------
-python
-bedtool
-rtool
 
 Reformat Peak file
 -----------------
@@ -20,22 +21,24 @@ Motif Overlap
 
 Compute Global Enrichment score
 ---------------
-* run Enricher.sh (developped by Pouya )
+Enricher.sh (developped by Pouya )
 
 
 Compute Positional and Peak-Rank Enrichment score
 -----------------
-* run computeCentdistScore.py 
+computeCentdistScore.py 
 
 
 Compute Avg-combine Score
 ---------------
-* run 
-
+combineAvgScore.py
 
 
 Compute Accept and Reject Probability
 ------------------------
-* run  
+AcceptReject.py
 
 
+Generate Html output
+--------------------------
+makehtml_png.py
